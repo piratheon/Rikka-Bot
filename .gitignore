@@ -1,0 +1,34 @@
+# Rikka-Bot Exclusions
+
+# Core Plan (Internal)
+plan.md
+ToDo.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+build/
+dist/
+
+# Database
+data/rikka.db*
+*.db
+*.db-journal
+
+# Configuration & Secrets
+.env
+config.json
+.vscode/
+.idea/
+
+# Logs
+rikka.log*
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

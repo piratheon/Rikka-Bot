@@ -1,0 +1,15 @@
+python-telegram-bot>=21.0
+aiosqlite
+pydantic>=2.0
+structlog
+python-dotenv
+httpx
+respx
+pytest
+pytest-asyncio
+cryptography
+APScheduler
+flake8
+google-genai
+googlesearch-python
+beautifulsoup4
