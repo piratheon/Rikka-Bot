@@ -14,5 +14,6 @@ google-genai
 googlesearch-python
 beautifulsoup4
 Flask[async]
+flask
 gunicorn
 asgiref
