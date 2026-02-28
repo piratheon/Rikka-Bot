@@ -10,26 +10,15 @@ def _ensure_log_dir(path: str):
 
 
 LOG_PATH = os.environ.get("RIKKA_LOG_PATH", "./rikka.log")
+_ensure_log_dir(LOG_PATH)
 
-# Check if we can write to LOG_PATH (might be read-only on Vercel)
-try:
-    _ensure_log_dir(LOG_PATH)
-    file_handler = logging.FileHandler(LOG_PATH)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-except (PermissionError, OSError):
-    # If read-only, we skip the file handler
-    pass
-
-# Always add StreamHandler for stdout (crucial for Vercel/Cloud logs)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(logging.Formatter("%(levelname)s: %(name)s - %(message)s"))
+# Configure stdlib logging to write to file
+handler = logging.FileHandler(LOG_PATH)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
 root = logging.getLogger()
 root.setLevel(logging.INFO)
-if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-    root.addHandler(stream_handler)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(LOG_PATH) for h in root.handlers):
+    root.addHandler(handler)
 
 # Configure structlog
 structlog.configure(

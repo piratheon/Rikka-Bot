@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import re
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
