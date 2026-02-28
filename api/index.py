@@ -21,37 +21,47 @@ from src.bot.app import build_application
 from src.config import Config
 from src.db.connection import get_db, DB_PATH
 from src.db.migrate import apply_migrations
+from src.utils.logger import logger
 
 app = Flask(__name__)
 
 # Ensure we use /tmp for the database if we are on Vercel (read-only filesystem)
 if os.environ.get("VERCEL"):
-    # We can't easily persist SQLite on Vercel across restarts, 
-    # but /tmp allows us to at least run the migrations and handle the current session.
-    # Oni-San should use an external DB for true persistence!
     os.environ["DATABASE_PATH"] = "/tmp/rikka.db"
+    logger.info("system_init", environment="vercel", db_path=os.environ["DATABASE_PATH"])
+else:
+    # Local fallback
+    if "DATABASE_PATH" not in os.environ:
+        os.environ["DATABASE_PATH"] = os.path.abspath(os.path.join(parent_dir, "data", "rikka.db"))
+    logger.info("system_init", environment="local", db_path=os.environ["DATABASE_PATH"])
 
 # Initialize Bot Application
-config = Config.load()
-bot_app = build_application(config)
-
-# Global flag to ensure initialization happens once
-is_initialized = False
+try:
+    config = Config.load()
+    bot_app = build_application(config)
+    logger.info("application_built", model=config.default_model)
+except Exception as e:
+    logger.exception("application_build_failed", error=str(e))
+    raise
 
 async def initialize_bot():
     global is_initialized
     if not is_initialized:
-        # Lay the SQL foundations!
         db_path = os.environ.get("DATABASE_PATH", "./data/rikka.db")
+        logger.info("applying_migrations", path=db_path)
         await apply_migrations(db_path)
         
-        # Wake up the Telegram application
+        logger.info("initializing_bot_application")
         await bot_app.initialize()
         is_initialized = True
 
 @app.route('/')
 def home():
-    return "🌸 Rikka-Bot is awake in this fragment! Nipah~!"
+    return "🌸 Rikka-Bot is awake in this fragment! Nipah~! <br><a href='/stats'>View Status</a>"
+
+@app.route('/health')
+def health():
+    return {"status": "awake", "initialized": is_initialized, "config": config.default_model}
 
 @app.route('/webhook', methods=['POST'])
 async def webhook():
@@ -59,12 +69,14 @@ async def webhook():
     await initialize_bot()
     if request.method == "POST":
         try:
-            update = Update.de_json(request.get_json(force=True), bot_app.bot)
+            data = request.get_json(force=True)
+            logger.info("webhook_received", update_id=data.get("update_id"))
+            update = Update.de_json(data, bot_app.bot)
             # Process the update synchronously in the loop
             await bot_app.process_update(update)
             return "OK", 200
         except Exception as e:
-            print(f"Error processing webhook fragment: {e}")
+            logger.exception("webhook_processing_failed", error=str(e))
             return str(e), 500
 
 @app.route('/stats')
