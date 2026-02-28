@@ -13,3 +13,6 @@ flake8
 google-genai
 googlesearch-python
 beautifulsoup4
+Flask[async]
+gunicorn
+asgiref
