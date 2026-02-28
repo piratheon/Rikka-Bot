@@ -20,7 +20,7 @@ Rikka is an advanced, persona-driven Telegram AI agent built with Python. She fe
 
 ### 2. Installation
 ```bash
-git clone https://github.com/yourusername/Rikka-Bot.git
+git clone https://github.com/piratheon/Rikka-Bot.git
 cd Rikka-Bot
 python -m venv .venv
 source .venv/bin/activate
@@ -54,4 +54,4 @@ docker-compose up -d
 ```
 
 ## 📜 License
-MIT
+MIT - see [LICENSE](LICENSE) file
