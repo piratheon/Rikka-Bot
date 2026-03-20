@@ -3,7 +3,11 @@ import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+<<<<<<< HEAD
 DB_PATH = os.environ.get("DATABASE_PATH", "./data/rikka.db")
+=======
+DB_PATH = os.environ.get("DATABASE_PATH", "./data/rk.db")
+>>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
 
 
 @asynccontextmanager

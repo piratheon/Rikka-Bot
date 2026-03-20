@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+<<<<<<< HEAD
     image: rikka-bot:latest
     container_name: rikka_bot
     restart: unless-stopped
@@ -21,4 +22,17 @@ services:
       - OPENROUTER_QUOTA_RESET_UTC_HOUR=0
 
     # Ensure log file exists so it can be mounted correctly
+=======
+    image: rk-agent:latest
+    container_name: rk_agent
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./soul.md:/app/soul.md:ro
+    env_file: .env
+    environment:
+      - DATABASE_PATH=/app/data/rk.db
+      - PYTHONUNBUFFERED=1
+>>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
     init: true
