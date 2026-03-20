@@ -15,7 +15,6 @@
 
 <br/>
 
-[![GitHub](https://img.shields.io/badge/github-piratheon-181717?style=flat-square&logo=github)](https://github.com/piratheon)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](LICENSE)
@@ -35,7 +34,7 @@
 
 ---
 
-> **rika-agent** is the evolution of [Rikka-Bot](https://github.com/piratheon/Rikka-Bot). Same soul, completely rebuilt architecture. v2.0 ships JSON function calling, background system monitoring, a three-level code sandbox, vision input, file delivery, and Ollama/G4F support — running entirely on your own server, with your data staying yours.
+> **rika-agent** is the evolution of [Rikka-Bot](https://github.com/piratheon/rika-agent/releases/tag/v1.0.0). Same soul, completely rebuilt architecture. v2.0 ships JSON function calling, background system monitoring, a three-level code sandbox, vision input, file delivery, and Ollama/G4F support — running entirely on your own server, with your data staying yours.
 
 ---
 
