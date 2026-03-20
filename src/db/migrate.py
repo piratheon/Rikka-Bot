@@ -30,11 +30,7 @@ async def apply_migrations(db_path: str):
             await conn.commit()
 
 
-<<<<<<< HEAD
-def run_sync(db_path: str = "./data/rikka.db"):
-=======
 def run_sync(db_path: str = "./data/rk.db"):
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
     # Use asyncio.run() which is compatible with modern Python event loop policy
     asyncio.run(apply_migrations(db_path))
 

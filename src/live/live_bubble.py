@@ -18,13 +18,6 @@ class LiveBubble:
         self.throttle = throttle_ms / 1000.0
         self._task = None
         self._last_flush = 0.0
-<<<<<<< HEAD
-        self._icons = {
-            "pending": "[ ]",
-            "running": "[~]",
-            "done": "[+]",
-            "error": "[!]",
-=======
         self._pulse_idx = 0
         self._pulse_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._icons = {
@@ -33,7 +26,6 @@ class LiveBubble:
             "done": "✅",
             "error": "❌",
             "thinking": "🧠",
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
         }
 
     def update(self, agent_id: str, text: str):
@@ -46,19 +38,6 @@ class LiveBubble:
             pass
 
     def render(self) -> str:
-<<<<<<< HEAD
-        parts = ["Rikka is assembling your team, Oni-San~", "", "Agents:"]
-        for aid, txt in self.sections.items():
-            # pick icon based on keywords
-            icon = self._icons.get("pending")
-            if "running" in txt.lower():
-                icon = self._icons.get("running")
-            if "done" in txt.lower() or "stored" in txt.lower():
-                icon = self._icons.get("done")
-            if "error" in txt.lower():
-                icon = self._icons.get("error")
-            parts.append(f"{icon} {aid} — {txt}")
-=======
         parts = ["<b>Processing request...</b>", "", "<b>Active Agents & Fragments:</b>"]
         self._pulse_idx = (self._pulse_idx + 1) % len(self._pulse_frames)
         pulse = self._pulse_frames[self._pulse_idx]
@@ -77,7 +56,6 @@ class LiveBubble:
                 icon = self._icons.get("error")
                 
             parts.append(f"{icon} <code>{aid}</code> — {txt}")
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
         return "\n".join(parts)
 
     async def start(self, flush_cb):
@@ -96,16 +74,6 @@ class LiveBubble:
 
     async def _loop(self, flush_cb):
         while True:
-<<<<<<< HEAD
-            await self.queue.get()
-            now = time.time()
-            elapsed = now - self._last_flush
-            if elapsed < self.throttle:
-                await asyncio.sleep(self.throttle - elapsed)
-            text = self.render()
-            await flush_cb(text)
-            self._last_flush = time.time()
-=======
             # Wait for an update or a pulse timeout (0.2s for smooth animation)
             try:
                 await asyncio.wait_for(self.queue.get(), timeout=0.2)
@@ -126,4 +94,3 @@ class LiveBubble:
             except Exception:
                 # If editing fails, maybe the message was deleted or same content
                 pass
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)

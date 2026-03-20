@@ -1,34 +1,3 @@
-<<<<<<< HEAD
-from __future__ import annotations
-import abc
-from typing import Any, AsyncIterator
-
-
-class ProviderError(Exception):
-    pass
-
-
-class ProviderAuthError(ProviderError):
-    pass
-
-
-class ProviderQuotaError(ProviderError):
-    pass
-
-
-class ProviderTransientError(ProviderError):
-    pass
-
-
-class BaseProvider(abc.ABC):
-    """Abstract provider adapter.
-
-    Concrete providers should implement `async def request(...)` and
-    `async def test_key()` for validation.
-    """
-
-    def __init__(self, api_key: str, provider_name: str):
-=======
 """Base provider — abstract interface with structured function-calling support."""
 from __future__ import annotations
 import abc, json
@@ -65,23 +34,10 @@ class BaseProvider(abc.ABC):
     SUPPORTS_FUNCTION_CALLING: bool = False
 
     def __init__(self, api_key: str, provider_name: str) -> None:
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
         self.api_key = api_key
         self.provider_name = provider_name
 
     @abc.abstractmethod
-<<<<<<< HEAD
-    async def request(self, payload: dict) -> dict:
-        """Send a completion request and return a parsed response dict."""
-
-    @abc.abstractmethod
-    async def stream(self, payload: dict) -> AsyncIterator[str]:
-        """Optional streaming generator yielding chunks of text."""
-
-    @abc.abstractmethod
-    async def test_key(self) -> bool:
-        """Run a minimal call to validate `self.api_key`. Return True if valid."""
-=======
     async def request(self, payload: Dict[str, Any]) -> Dict[str, Any]: ...
     @abc.abstractmethod
     async def stream(self, payload: Dict[str, Any]) -> AsyncIterator[str]: ...
@@ -113,4 +69,3 @@ class BaseProvider(abc.ABC):
     def _extract_openai_content(choices: List[Dict]) -> str:
         if not choices: return ""
         return choices[0].get("message", {}).get("content") or ""
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)

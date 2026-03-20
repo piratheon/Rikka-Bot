@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-from pydantic import BaseModel
-from typing import List, Dict, Literal
-=======
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -12,22 +8,15 @@ from pydantic import BaseModel, Field
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
 
 
 class AgentSpec(BaseModel):
     id: str
     name: str
     role: str
-<<<<<<< HEAD
-    system_prompt: str
-    tools: List[str] = []
-    output_schema: Dict = {}
-=======
     system_prompt: str = ""
     tools: List[str] = []
     output_schema: Dict[str, Any] = {}
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
     depends_on: List[str] = []
     model_preference: Literal["fast", "smart"] = "smart"
 
@@ -35,9 +24,6 @@ class AgentSpec(BaseModel):
 class TaskPlan(BaseModel):
     reasoning: str
     agents: List[AgentSpec] = []
-<<<<<<< HEAD
-    final_synthesis_prompt: str | None = None
-=======
     final_synthesis_prompt: Optional[str] = None
 
 
@@ -71,4 +57,3 @@ class BackgroundAgentConfig(BaseModel):
     interval_seconds: int = 60
     enabled: bool = True
     created_at: str = Field(default_factory=_utcnow)
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)

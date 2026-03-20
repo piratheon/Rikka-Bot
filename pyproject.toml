@@ -1,18 +1,4 @@
 [project]
-<<<<<<< HEAD
-name = "rikka-bot"
-version = "0.1.0"
-description = "Rikka Bot - agentic Telegram assistant"
-requires-python = ">=3.12"
-dependencies = [
-  "python-telegram-bot>=21.0",
-  "aiosqlite",
-  "pydantic>=2.0",
-  "structlog",
-  "python-dotenv",
-  "httpx",
-]
-=======
 name = "rk-agent"
 version = "3.0.0"
 description = "rk-agent — agentic Telegram assistant with background monitoring"
@@ -46,4 +32,3 @@ asyncio_mode = "auto"
 
 [project.scripts]
 rk-agent = "src.bot.app:main"
->>>>>>> 7599a86 (Upgrade: From rika-bot to rika-agent)
