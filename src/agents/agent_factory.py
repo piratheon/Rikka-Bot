@@ -71,10 +71,10 @@ async def execute_tool(tool_name: str, arguments: Dict[str, Any], user_id: int,
     try:
         # Special handling for tools with known argument shapes
         if tool_name == "run_shell_command":
-            cmd = arguments.get("command", "")
+            cmd = arguments.get("command") or arguments.get("query", "")
             raw = await tool_fn(cmd, user_id=user_id) if asyncio.iscoroutinefunction(tool_fn) else tool_fn(cmd, user_id=user_id)
         elif tool_name == "run_python":
-            code = arguments.get("code", "")
+            code = arguments.get("code") or arguments.get("query", "")
             timeout = arguments.get("timeout_seconds", 30)
             raw = await tool_fn(code, timeout_seconds=int(timeout)) if asyncio.iscoroutinefunction(tool_fn) else tool_fn(code)
         elif tool_name == "watch_task_logs":
