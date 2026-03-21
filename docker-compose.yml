@@ -8,6 +8,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./soul.md:/app/soul.md:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file: .env
     environment:
       - DATABASE_PATH=/app/data/rk.db
