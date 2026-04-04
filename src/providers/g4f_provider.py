@@ -6,9 +6,9 @@ Uses the `g4f` library which routes requests through various free providers
 WARNING: G4F providers are unstable by nature — they rely on reverse-engineered
 APIs and can break without notice. Use as a last-resort fallback, not primary.
 
-Model mapping:
-  The provider attempts to use the requested model name. If unavailable,
-  it falls back through a priority list of known-working free models.
+Default configuration:
+  Provider: DeepInfra
+  Model: MiniMaxAI/MiniMax-M2.5
 """
 from __future__ import annotations
 
@@ -23,8 +23,13 @@ from src.providers.base_provider import (
 )
 from src.utils.logger import logger
 
+# Default G4F configuration
+DEFAULT_G4F_PROVIDER = "DeepInfra"
+DEFAULT_G4F_MODEL = "MiniMaxAI/MiniMax-M2.5"
+
 # Fallback chain if the requested model isn't available via g4f
 _FALLBACK_MODELS = [
+    DEFAULT_G4F_MODEL,
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4",
@@ -63,6 +68,7 @@ class G4FProvider(BaseProvider):
         try:
             from g4f.client import Client
             client = Client()
+            # Use DeepInfra provider with MiniMax-M2.5 model
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,

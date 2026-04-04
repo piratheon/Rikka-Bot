@@ -26,7 +26,13 @@ class Config(BaseModel):
     allowed_user_ids: List[int] = []
     default_provider_priority: List[str] = ["groq", "openrouter", "gemini"]
     max_api_keys_per_user: int = 10
-    max_context_messages: int = 40
+    max_context_messages: int = 10
+    summarization_interval: int = 8
+    max_pinned_memories: int = 5
+    max_relevant_memories: int = 4     # sliding window — raw messages kept
+    summarization_interval: int = 8    # trigger incremental summary every N messages
+    max_pinned_memories: int = 5       # hard cap on always-injected memories
+    max_relevant_memories: int = 4     # semantic retrieval per call
     max_agents_per_task: int = 6
     agent_task_timeout_seconds: int = 90
     live_bubble_throttle_ms: int = 800
@@ -52,19 +58,34 @@ class Config(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     ollama_default_model: str = "llama3.2"
     g4f_enabled: bool = False
+    
+    # Per-provider model configuration (fallbacks if not set)
+    groq_model: str = "llama-3.3-70b-versatile"
+    openrouter_model: str = "google/gemini-2.0-flash-001"
+    gemini_model: str = "gemini-2.0-flash"
+    ollama_model: str = "llama3.2"
+    g4f_model: str = "MiniMaxAI/MiniMax-M2.5"  # DeepInfra provider
+    
     max_background_agents_per_user: int = 10
     wake_event_retention_days: int = 30
     max_concurrent_orchestrations_per_user: int = 2
     system_prompt: str = ""
+    
+    # Tool execution timeout in seconds
+    tool_timeout_seconds: int = 10
 
     TECHNICAL_MANDATES: ClassVar[str] = (
         "\n\n--- OPERATIONAL RULES ---\n"
         "1. ACCURACY: Ground responses in reality. Use tools to verify facts.\n"
         "2. RESPONSE: After gathering information, respond naturally and completely.\n"
-        "3. TOOL CALL: To use a tool output ONLY: TOOL: tool_name | QUERY: your query\n"
-        "   Never add preamble in the same turn as a tool call.\n"
-        "4. NO HALLUCINATION: If a tool fails, be honest. Never fabricate results.\n"
-        "5. BACKGROUND AGENTS: Suggest /watch commands when the user wants monitoring.\n"
+        "3. REASONING: You can reason, think, and respond directly without tools for:\n"
+        "   - Casual conversation, greetings, questions\n"
+        "   - Factual questions from your training knowledge\n"
+        "   - Analysis, explanations, creative tasks\n"
+        "   - Any task that doesn't require real-time data or system access\n"
+        "4. TOOLS require background watchers: For tool execution (web_search, shell commands, etc.),\n"
+        "   the user must have active watchers. Suggest /watch or /autowatch if they need tools.\n"
+        "5. NO HALLUCINATION: If a tool fails or isn't available, be honest. Never fabricate results.\n"
         "6. WORKSPACE: Your sandbox is ~/.Rika-Workspace (path in runtime context).\n"
         "   Write temp files, scripts, and analysis artifacts there by default.\n"
         "7. COMMAND SECURITY: Destructive commands are blocked automatically.\n"
@@ -83,8 +104,14 @@ class Config(BaseModel):
             tools.append("- run_shell_command: Execute shell commands (cwd = workspace).")
             tools.append("- run_python: Execute Python in a sandboxed environment.")
         tools += [
-            "- save_memory: Persist key-value pair. Format: 'key | value'",
+            "- list_workspace: List files in the workspace.",
+            "- read_file: Read content from a file (path, max_lines=200).",
+            "- write_file: Write text/JSON/code to a file (path, content, mode='w').",
+            "- send_file: Send a workspace file to the user (path, caption='').",
+            "- save_memory: Persist key-value pair. Format: 'key | value'.",
             "- get_memories: Retrieve all stored memories and skills.",
+            "- save_skill: Store a reusable skill/code snippet. Format: 'name | code'.",
+            "- use_skill: Load a stored skill by name. Format: 'skill_name'.",
             "- delegate_task: Spawn a research sub-agent for a specific query.",
         ]
         if not tools:

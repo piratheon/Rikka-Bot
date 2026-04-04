@@ -24,7 +24,7 @@ lxml
 # Ollama itself runs as a separate process: https://ollama.com
 
 # Optional: Free providers (uncomment to enable)
-# g4f
+g4f
 
 # Dev / testing
 respx

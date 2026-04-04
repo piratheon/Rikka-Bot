@@ -9,6 +9,7 @@ Changes vs v1:
 - /memory, /deletememory commands.
 - Sentinel promoted to BackgroundAgentManager with system watcher.
 - Streaming path wired through LiveBubble for direct replies.
+- Core logic extracted to src.core for reuse across interfaces.
 """
 from __future__ import annotations
 
@@ -39,10 +40,25 @@ except ModuleNotFoundError:
     from src.config import Config
     from src.providers.provider_pool import get_pool
 
+# Import core logic
+from src.core import (
+    AgentState,
+    AgentStatus,
+    ContextBuilder,
+    Orchestrator,
+    ToolCall,
+    ToolResult,
+    classify_complexity,
+)
+
 from src.utils.logger import logger
 
 # Per-user semaphore map — limits concurrent orchestration tasks
 _USER_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+
+# Active task tracking — for stop button
+_ACTIVE_TASKS: Dict[int, asyncio.Task] = {}  # user_id → task
+_CANCEL_FLAGS: Dict[int, bool] = {}  # user_id → cancel flag
 
 def _get_semaphore(user_id: int) -> asyncio.Semaphore:
     cfg = Config.get()
@@ -122,11 +138,14 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"<b>{cfg.bot_name} commands</b>\n\n"
         "/start — Initialize bot\n"
         "/help — Show this message\n"
+        "/stop — Stop current task/research\n"
         "/addkey provider:\"key\" — Add an API key\n"
         "/status — Key status, model, active agents\n"
         "/providers — All providers and connectivity status\n"
         "/reload — Reload config + tool registry from disk (owner only)\n"
         "/memory — List stored memories and skills\n"
+        "/pinmemory &lt;key&gt; — Always inject this memory (max 5)\n"
+        "/unpinmemory &lt;key&gt; — Remove from always-injected list\n"
         "/deletememory key — Delete a memory entry\n"
         "/delete_me — Delete all your stored data\n\n"
         "<b>Workspace</b>\n"
@@ -135,6 +154,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/cleanworkspace — Wipe workspace contents\n"
         "/cmdhistory — Recent command execution log\n\n"
         "<b>Background monitoring</b>\n"
+        "/autowatch &lt;goal&gt; — AI decides what to monitor and sets it up\n"
         "/watch system — Monitor CPU / memory / disk\n"
         "/watch process &lt;name&gt; — Watch if a process is running\n"
         "/watch url &lt;url&gt; — HTTP health check\n"
@@ -222,11 +242,15 @@ async def delete_me_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ---------------------------------------------------------------------------
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("status_handler_called", user_id=update.effective_user.id)
     from src.db.key_store import list_api_keys, upsert_user
     tg_user = update.effective_user
     cfg = Config.get()
+    logger.info("status_handler_config_loaded")
     user_id = await upsert_user(tg_user.id, tg_user.username)
+    logger.info("status_handler_user_upserted", user_id=user_id)
     keys = await list_api_keys(user_id)
+    logger.info("status_handler_keys_loaded", count=len(keys))
     active = [k for k in keys if not k["is_blacklisted"]]
     env_count = sum(1 for p in ["GEMINI", "GROQ", "OPENROUTER"] if os.environ.get(f"{p}_API_KEY"))
 
@@ -236,6 +260,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if manager:
         agents = await manager.list_for_user(user_id)
         bg_count = sum(1 for a in agents if a.enabled)
+    logger.info("status_handler_sending_response")
 
     msg = (
         f"<b>Status — {cfg.bot_name}</b>\n\n"
@@ -246,6 +271,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Background agents: {bg_count} active"
     )
     await update.message.reply_html(msg)
+    logger.info("status_handler_response_sent")
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +290,9 @@ async def memory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = ["<b>Stored memories and skills:</b>\n"]
     for e in entries:
         tag = "M" if e["type"] == "memory" else "S"
-        lines.append(f"[{tag}] <b>{_escape_html(e['key'])}</b>: {_escape_html(e['value'][:80])}")
+        pin = " [pinned]" if e.get("pinned") else ""
+        acc = f" (used {e.get('access_count', 0)}x)" if e.get("access_count", 0) > 0 else ""
+        lines.append(f"[{tag}]{pin} <b>{_escape_html(e['key'])}</b>: {_escape_html(str(e['value'])[:80])}{acc}")
     await update.message.reply_html("\n".join(lines))
 
 
@@ -436,10 +464,34 @@ async def watch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 interval_seconds=interval_seconds,
             )
             description = f"Scheduled task every {interval_str}: {task_desc[:60]}"
+        elif watcher_type == "script":
+            if not rest:
+                await update.message.reply_text(
+                    "Usage: /watch script <script_path> [cooldown:<seconds>]\n"
+                    "The script should print ALERT: <msg> on problems, exit 0 if fine."
+                )
+                return
+            script_path = rest[0]
+            cooldown = 120
+            for token in rest[1:]:
+                if token.startswith("cooldown:"):
+                    cooldown = int(token.split(":")[1])
+            agent_cfg = BackgroundAgentConfig(
+                id=f"scr_{agent_id}",
+                user_id=user_id,
+                chat_id=chat_id,
+                watcher_type="script",
+                name=f"Script: {os.path.basename(script_path)}",
+                description=f"Run {script_path} and alert on non-zero exit or ALERT: output.",
+                config={"script_path": script_path, "cooldown_seconds": cooldown},
+                interval_seconds=60,
+            )
+            description = f"Script watcher: {script_path}"
+
         else:
             await update.message.reply_text(
                 f"Unknown watcher type: '{watcher_type}'. "
-                "Use: system, process, url, port, log, cron"
+                "Use: system, process, url, port, log, cron, script"
             )
             return
 
@@ -606,6 +658,53 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ---------------------------------------------------------------------------
+# Stop task button handler
+# ---------------------------------------------------------------------------
+
+async def stop_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle stop button click — cancels current task for user."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    # Set cancel flag
+    _CANCEL_FLAGS[user_id] = True
+    
+    # Cancel the active task
+    if user_id in _ACTIVE_TASKS:
+        task = _ACTIVE_TASKS[user_id]
+        if not task.done():
+            task.cancel()
+            await query.answer("Stopping task...")
+            logger.info("task_cancelled_by_user", user_id=user_id)
+            return
+    
+    await query.answer("No active task to stop.")
+
+
+# ---------------------------------------------------------------------------
+# /stop command — cancel current task
+# ---------------------------------------------------------------------------
+
+async def stop_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stop command — cancels current task for user."""
+    user_id = update.effective_user.id
+    
+    # Set cancel flag
+    _CANCEL_FLAGS[user_id] = True
+    
+    # Cancel the active task
+    if user_id in _ACTIVE_TASKS:
+        task = _ACTIVE_TASKS[user_id]
+        if not task.done():
+            task.cancel()
+            logger.info("task_cancelled_by_command", user_id=user_id)
+            await update.message.reply_text("✅ Task stopped.")
+            return
+    
+    await update.message.reply_text("No active task to stop.")
+
+
+# ---------------------------------------------------------------------------
 # Document handler — fix: no longer mutates update.message.text
 # ---------------------------------------------------------------------------
 
@@ -648,59 +747,10 @@ def _agent_name(cfg=None) -> str:
 
 def _build_runtime_context(tg_user, cfg) -> str:
     """Build a compact runtime context block injected at the top of every request.
-    Gives the agent grounding: who it's talking to, what time it is, what host
-    it's running on — so it can give accurate, contextual answers without guessing.
+    
+    Wrapper around core ContextBuilder for backward compatibility.
     """
-    import platform
-    import socket
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    # Also get local time with offset for the user's likely context
-    local_now = datetime.now()
-
-    username = tg_user.username or tg_user.first_name or f"user_{tg_user.id}"
-    full_name = " ".join(filter(None, [tg_user.first_name, tg_user.last_name]))
-
-    try:
-        hostname = socket.gethostname()
-    except Exception:
-        hostname = "unknown"
-
-    try:
-        os_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
-    except Exception:
-        os_info = "unknown"
-
-    try:
-        python_ver = platform.python_version()
-    except Exception:
-        python_ver = "unknown"
-
-    try:
-        from src.tools.workspace import get_workspace_path
-        workspace = str(get_workspace_path(getattr(cfg, "workspace_path", None)))
-    except Exception:
-        workspace = "~/.Rika-Workspace"
-
-    lines = [
-        "--- RUNTIME CONTEXT ---",
-        f"UTC time      : {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
-        f"Local time    : {local_now.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"User          : {username}" + (f" ({full_name})" if full_name and full_name != username else ""),
-        f"Telegram ID   : {tg_user.id}",
-        f"Bot name      : {cfg.bot_name}",
-        f"Host          : {hostname}",
-        f"OS            : {os_info}",
-        f"Python        : {python_ver}",
-        f"Model         : {cfg.default_model}",
-        f"Workspace     : {workspace}",
-        f"Cmd security  : {'enabled (' + getattr(cfg, 'command_security_level', 'standard') + ')' if getattr(cfg, 'enable_command_security', True) else 'disabled'}",
-        f"Sandbox       : level {getattr(cfg, 'sandbox_level', 0)} ({['RestrictedPython','process+ulimit','Docker'][min(getattr(cfg,'sandbox_level',0),2)]})",
-        f"Agent name    : {_agent_name(cfg)}",
-        "--- END CONTEXT ---",
-    ]
-    return "\n".join(lines)
+    return ContextBuilder.build_runtime_context(tg_user, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +771,7 @@ async def _process_message(
         add_chat_message,
         get_chat_history,
         get_summary_data,
+        count_messages_since,
     )
     from src.db.key_store import add_api_key, init_db, list_api_keys, upsert_user
     from src.live.live_bubble import LiveBubble
@@ -778,82 +829,48 @@ async def _process_message(
     logger.debug("complexity_routing", is_complex=is_complex, text_len=len(text))
 
     if not is_complex:
-        await _handle_direct_reply(update, context, user_id, text, context_str, history, summary, cfg, pool)
+        await _handle_direct_reply(update, context, user_id, text, context_str, history, summary, cfg, pool, last_msg_id)
     else:
-        sent = await update.message.reply_text(f"{_agent_name(cfg)} is processing...")
+        # Create stop button with proper InlineKeyboardMarkup
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"stop_task:{user_id}")]])
+        sent = await update.message.reply_text(
+            f"{_agent_name(cfg)} is thinking...\n\n_This may take up to 60 seconds. Click Stop to cancel._",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
         sem = _get_semaphore(user_id)
-        asyncio.create_task(
+        
+        # Clear cancel flag for new task
+        _CANCEL_FLAGS[user_id] = False
+        
+        # Create and track task
+        task = asyncio.create_task(
             _run_orchestration_guarded(
                 sem, context.bot, update.effective_chat.id, sent.message_id,
-                user_id, context_str, text, history, summary, cfg
+                user_id, context_str, text, history, summary, cfg, keyboard
             )
         )
+        _ACTIVE_TASKS[user_id] = task
+        
+        # Clean up task tracking when done
+        def cleanup(t):
+            _ACTIVE_TASKS.pop(user_id, None)
+        task.add_done_callback(cleanup)
 
 
 async def _classify_complexity(text: str, cfg: Config, pool, user_id: int) -> bool:
     """Classify whether a message requires tools / orchestration.
-
-    Three-tier approach (cheapest first):
-    1. Obvious simple: short greeting/question → False immediately, no LLM call.
-    2. Obvious complex: contains explicit tool keywords → True immediately, no LLM call.
-    3. Ambiguous: single cheap LLM classification call.
-
-    This eliminates the LLM call for ~70% of messages.
+    
+    Wrapper around core classify_complexity for backward compatibility.
     """
-    t = text.lower().strip()
-
-    # Tier 1 — definitely simple (no LLM call)
-    _SIMPLE_PATTERNS = (
-        r"^(hi|hello|hey|yo|sup|greetings|good morning|good evening|good night|what's up|whats up)[\s!?.]*$",
-        r"^(thanks|thank you|thx|ty|ok|okay|yes|no|sure|np|nice|cool|great|perfect|got it|understood)[\s!?.]*$",
-        r"^(who are you|what are you|what can you do|help me|what's your name)[\s?]*$",
-    )
-    import re as _re
-    if any(_re.match(p, t) for p in _SIMPLE_PATTERNS):
-        return False
-
-    # Tier 2 — definitely complex (no LLM call)
-    _COMPLEX_KEYWORDS = [
-        "search", "find", "fetch", "run ", "execute", "check ", "analyze",
-        "research", "monitor", "calculate", "wikipedia", "curl ", "shell",
-        "install ", "download ", "git ", "docker ", "systemctl", "grep ",
-        "ls ", "pwd", "cat ", "write a script", "write a program", "create a file",
-        "what is the price", "who is the ceo", "latest news", "current",
-        "memory", "remember ", "delegate", "uptime", "disk usage",
-    ]
-    if len(text) > 200 or any(kw in t for kw in _COMPLEX_KEYWORDS):
-        return True
-
-    # Tier 3 — ambiguous: ask the LLM with a minimal prompt
-    try:
-        payload = {
-            "model": cfg.default_model,
-            "messages": [
-                {"role": "system", "content": (
-                    "Classify the user message. Reply with ONE word only: "
-                    "SIMPLE or COMPLEX. "
-                    "SIMPLE = casual chat, greetings, factual questions answerable from memory. "
-                    "COMPLEX = needs web search, code execution, file operations, real-time data, "
-                    "multi-step research, or system interaction."
-                )},
-                {"role": "user", "content": text[:200]},
-            ],
-        }
-        for p in (cfg.default_provider_priority or ["gemini", "groq", "openrouter"]):
-            try:
-                resp = await pool.request_with_key(user_id, p, payload)
-                answer = (resp.get("output") or "").strip().upper()
-                return "COMPLEX" in answer
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return len(text) > 100
+    return await classify_complexity(text, cfg, pool, user_id)
 
 
 async def _handle_direct_reply(
-    update, context, user_id, text, context_str, history, summary, cfg, pool
+    update, context, user_id, text, context_str, history, summary, cfg, pool, last_msg_id
 ) -> None:
+    logger.info("direct_reply_handler", user_id=user_id, text_len=len(text), context_len=len(context_str))
     from src.db.chat_store import add_chat_message
     payload = {
         "model": cfg.default_model,
@@ -862,23 +879,61 @@ async def _handle_direct_reply(
             {"role": "user", "content": context_str},
         ],
     }
-    priorities = cfg.default_provider_priority or ["gemini", "groq", "openrouter"]
+    # Filter priorities to only providers with valid keys
+    all_priorities = cfg.default_provider_priority or ["gemini", "groq", "openrouter"]
+    available = await pool.get_available_providers(user_id)
+    priorities = [p for p in all_priorities if p in available]
+    
+    if not priorities:
+        logger.error("direct_reply_no_available_providers", available=available, configured=all_priorities)
+        await update.message.reply_text("No API keys configured. Add one with /addkey provider:\"key\"")
+        return
+    
+    logger.info("direct_reply_starting", user_id=user_id, priorities=priorities, available=available)
     reply = None
+    last_error = None
+    
+    # Try each provider in priority order
     for p in priorities:
+        # Check cancel before each provider
+        if _CANCEL_FLAGS.get(user_id, False):
+            logger.info("direct_reply_cancelled_before_provider", provider=p)
+            _CANCEL_FLAGS[user_id] = False
+            await update.message.reply_text(f"{_agent_name(cfg)} task cancelled.")
+            return
+        
         try:
-            resp = await pool.request_with_key(user_id, p, payload)
+            logger.info("direct_reply_try_provider", provider=p, user_id=user_id)
+            # 60s timeout for HTTP requests (prevents hanging on bad connections/keys)
+            resp = await asyncio.wait_for(
+                pool.request_with_key(user_id, p, payload),
+                timeout=60.0
+            )
             reply = resp.get("output", "").strip()
             if reply:
+                logger.info("direct_reply_got_response", provider=p, reply_len=len(reply), first_50=reply[:50])
                 break
-        except Exception:
+        except asyncio.TimeoutError:
+            logger.error("direct_reply_provider_timeout", provider=p, timeout=60)
+            last_error = f"Provider {p} timed out"
             continue
-
+        except Exception as exc:
+            logger.exception("direct_reply_provider_failed", provider=p, error=str(exc))
+            last_error = str(exc)
+            continue
+    
     if not reply:
-        await update.message.reply_text("All providers failed. Please try again.")
+        logger.error("direct_reply_no_response", priorities=priorities, available=available, last_error=last_error)
+        error_msg = "All providers failed."
+        if last_error:
+            error_msg += f" Last error: {last_error}"
+        error_msg += " Check your API keys with /status or add one with /addkey"
+        await update.message.reply_text(error_msg)
         return
 
     # If LLM spontaneously tried to use a tool in "simple" mode, re-route
     if re.search(r"TOOL:\s*\w+", reply, re.IGNORECASE):
+        logger.info("direct_reply_reroute_to_orchestration")
         sent = await update.message.reply_text(f"{_agent_name(cfg)} is processing...")
         sem = _get_semaphore(user_id)
         asyncio.create_task(
@@ -890,21 +945,24 @@ async def _handle_direct_reply(
         return
 
     await add_chat_message(user_id, "assistant", reply)
-    await update.message.reply_html(reply)
-
-    if len(history) >= cfg.max_context_messages:
-        asyncio.create_task(_trigger_summarization(user_id, history, summary, pool, cfg))
+    logger.info("direct_reply_sending", reply_len=len(reply))
+    try:
+        await update.message.reply_html(reply)
+        logger.info("direct_reply_sent_success")
+    except Exception as exc:
+        logger.exception("direct_reply_send_failed", error=str(exc))
 
 
 async def _run_orchestration_guarded(
     sem: asyncio.Semaphore, bot, chat_id, message_id, user_id,
-    context_str, original_text, history, summary, cfg
+    context_str, original_text, history, summary, cfg, keyboard=None
 ) -> None:
     if sem.locked() and sem._value == 0:  # type: ignore[attr-defined]
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
-                text="Another task is already running. Please wait."
+                text="Another task is already running. Please wait.",
+                reply_markup=keyboard
             )
         except Exception:
             pass
@@ -912,7 +970,7 @@ async def _run_orchestration_guarded(
     async with sem:
         await run_orchestration_background(
             bot, chat_id, message_id, user_id,
-            context_str, original_text, history, summary
+            context_str, original_text, history, summary, keyboard
         )
 
 
@@ -963,11 +1021,12 @@ async def _handle_key_submission(update, context, user_id, keys, cfg) -> None:
 
 async def run_orchestration_background(
     bot, chat_id: int, message_id: int, user_id: int,
-    context_str: str, original_text: str, history: list, summary: Optional[str]
+    context_str: str, original_text: str, history: list, summary: Optional[str],
+    keyboard=None
 ) -> None:
     from src.db.chat_store import add_chat_message
     from src.live.live_bubble import LiveBubble
-    
+
     cfg = Config.get()
     pool = get_pool()
     bubble = LiveBubble(throttle_ms=cfg.live_bubble_throttle_ms)
@@ -975,7 +1034,9 @@ async def run_orchestration_background(
     async def flush(text: str) -> None:
         try:
             await bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML"
+                chat_id=chat_id, message_id=message_id,
+                text=text, parse_mode="HTML",
+                reply_markup=keyboard  # Preserve stop button
             )
         except Exception:
             pass
@@ -1005,54 +1066,106 @@ async def run_orchestration_background(
 
     try:
         for turn in range(10):
+            # Check cancel flag
+            if _CANCEL_FLAGS.get(user_id, False):
+                await flush(f"{_agent_name(cfg)} task stopped by user.")
+                _CANCEL_FLAGS[user_id] = False  # Reset flag
+                return
+            
             bubble.update("Thinking", f"turn {turn + 1}...")
-            payload = {"model": cfg.default_model, "messages": thought_history}
+            
+            # Get tool schemas for JSON function calling
+            from src.tools.schemas import get_all_schemas
+            tool_schemas = get_all_schemas()
+            logger.info("tool_schemas_loaded", count=len(tool_schemas))
+            # Pass ToolSchema objects - providers will call to_openai() themselves
+            openai_schemas = tool_schemas
+            
+            # Use provider-specific models from config (with fallbacks)
+            model_map = {
+                "groq": getattr(cfg, "groq_model", "llama-3.3-70b-versatile"),
+                "openrouter": getattr(cfg, "openrouter_model", "google/gemini-2.0-flash-001"),
+                "gemini": getattr(cfg, "gemini_model", "gemini-2.0-flash"),
+                "ollama": getattr(cfg, "ollama_model", "llama3.2"),
+                "g4f": getattr(cfg, "g4f_model", "MiniMaxAI/MiniMax-M2.5"),
+            }
 
             resp = None
+            last_error = None
             for p_name in priorities:
+                # Check cancel between providers
+                if _CANCEL_FLAGS.get(user_id, False):
+                    await flush(f"{_agent_name(cfg)} task stopped by user.")
+                    _CANCEL_FLAGS[user_id] = False
+                    return
+                
+                # Build payload with correct model for this provider
+                payload = {
+                    "model": model_map.get(p_name, cfg.default_model),
+                    "messages": thought_history,
+                }
+                
                 try:
-                    resp = await pool.request_with_key(user_id, p_name, payload)
-                    if resp.get("output"):
+                    # Use structured function calling with JSON schemas
+                    resp = await asyncio.wait_for(
+                        pool.request_with_key_structured(user_id, p_name, payload, openai_schemas),
+                        timeout=60.0
+                    )
+                    # Check if LLM returned tool calls
+                    if resp.has_tool_calls:
                         break
+                    elif resp.content:
+                        break
+                except asyncio.TimeoutError:
+                    logger.warning("orchestration_provider_timeout", provider=p_name, timeout=60)
+                    last_error = f"Provider {p_name} timed out"
+                    continue
                 except Exception as exc:
                     logger.warning("orchestration_provider_failed", provider=p_name, error=str(exc))
+                    last_error = str(exc)
+                    continue
 
-            if not resp or not resp.get("output"):
+            if not resp:
+                if last_error:
+                    await flush(f"All providers failed: {last_error}")
                 break
+            
+            # Handle tool calls from JSON response
+            if resp.has_tool_calls:
+                for tool_call in resp.tool_calls:
+                    t_name = tool_call.name
+                    t_args = tool_call.arguments  # Already parsed as dict!
+                    
+                    logger.info("tool_call_received", tool=t_name, arguments=t_args)
+                    
+                    preamble = ""  # No preamble for tool calls
+                    if preamble and len(preamble) > 5:
+                        narrative_chunks.append(preamble)
+                    
+                    bubble.update("Tool", f"running {t_name}...")
+                    from src.agents.agent_factory import execute_tool
+                    tool_result = await execute_tool(t_name, t_args, user_id, system_prompt=cfg.system_prompt, bubble=bubble)
+                    
+                    logger.info("tool_result", tool=t_name, result_preview=tool_result[:100] if tool_result else None)
+                    
+                    # Handle file delivery marker
+                    if tool_result.startswith("__SEND_FILE__:"):
+                        parts = tool_result.split(":", 2)
+                        file_path = parts[1] if len(parts) > 1 else ""
+                        file_caption = parts[2] if len(parts) > 2 else ""
+                        if file_path:
+                            sent = await _send_agent_file(bot, chat_id, cfg.workspace_path, file_path, file_caption)
+                            tool_result = f"File sent: {file_path}" if sent else f"Failed to send file: {file_path}"
+                    
+                    thought_history.append({"role": "assistant", "content": None, "tool_calls": [{"id": tool_call.call_id, "type": "function", "function": {"name": t_name, "arguments": json.dumps(t_args)}}]})
+                    thought_history.append({"role": "tool", "content": tool_result, "tool_call_id": tool_call.call_id})
+                    agent_results[f"turn_{turn}"] = {"output": tool_result, "tool_used": t_name}
+                continue  # Continue to next turn with tool results in history
+            
+            # No tool calls - LLM returned final content
+            output = resp.content
 
-            output: str = resp["output"]
-
-            # Parse tool call
-            match = re.search(
-                r"TOOL:\s*([\w_]+)\s*\|?\s*QUERY:\s*(.*)",
-                output,
-                re.IGNORECASE | re.DOTALL,
-            )
-
-            if match:
-                t_name = match.group(1).strip()
-                t_query = match.group(2).strip()
-
-                preamble = output[: match.start()].strip()
-                clean_pre = re.sub(r"TOOL:.*", "", preamble, flags=re.IGNORECASE | re.DOTALL).strip()
-                if clean_pre and len(clean_pre) > 5:
-                    narrative_chunks.append(clean_pre)
-                    bubble.update("Reasoning", (clean_pre[:120] + "...") if len(clean_pre) > 120 else clean_pre)
-
-                bubble.update("Tool", f"running {t_name}...")
-                from src.agents.agent_models import AgentSpec
-                from src.agents.agent_factory import execute_tool
-                tool_result = await execute_tool(t_name, {"query": t_query}, user_id, system_prompt=cfg.system_prompt, bubble=bubble)
-                tool_result = await execute_tool(t_name, {"query": t_query}, user_id, system_prompt=cfg.system_prompt)
-
-                thought_history.append({"role": "assistant", "content": output})
-                thought_history.append(
-                    {"role": "user", "content": f"TOOL_RESULT ({t_name}):\n{tool_result}"}
-                )
-                agent_results[f"turn_{turn}"] = {"output": tool_result, "tool_used": t_name}
-                continue
-
-            # Final response turn
+            # Final response turn - no tool calls
             bubble.update("Thinking", "done")
             await bubble.stop()
 
@@ -1110,6 +1223,13 @@ async def run_orchestration_background(
             text="The reasoning loop reached its turn limit. Please rephrase your request."
         )
 
+    except asyncio.CancelledError:
+        # Task was cancelled by stop button
+        logger.info("orchestration_cancelled", user_id=user_id)
+        await bubble.stop()
+        # Message already updated by cancel flag check
+        return
+
     except Exception as exc:
         logger.exception("orchestration_loop_failed", error=str(exc))
         await bubble.stop()
@@ -1129,17 +1249,30 @@ def _split_message(text: str, max_len: int) -> list:
 
 
 async def _trigger_summarization(user_id, history, old_summary, pool, cfg) -> None:
-    from src.db.chat_store import update_summary
+    """Incremental summarization: only compress the oldest messages into the rolling summary.
+    Cheap and frequent is better than expensive and rare.
+    """
+    from src.db.chat_store import update_summary, count_messages_since
     logger.info("triggering_summarization", user_id=user_id)
+
+    # Only summarize the oldest messages (not the whole history)
+    interval = getattr(cfg, "summarization_interval", 8)
+    to_compress = history[:max(1, len(history) - 4)]  # keep last 4 raw, compress the rest
+    if not to_compress:
+        return
+
     history_text = ""
-    for m in history:
-        history_text += f"{m['role']}: {m['content']}\n"
-        if m.get("metadata"):
-            history_text += f"(Tool results: {json.dumps(m['metadata'])})\n"
+    for m in to_compress:
+        role = m["role"]
+        content = m["content"][:400]  # cap individual message length
+        history_text += f"{role}: {content}\n"
+
     prompt = (
-        "Summarize the following conversation into a dense 'Permanent Knowledge State'.\n"
-        "Include: key user facts, technical findings, current goals, pending tasks.\n\n"
-        f"Old state: {old_summary or 'None'}\n\nNew history:\n{history_text}"
+        "Update the knowledge state with new conversation turns. "
+        "Be dense and factual. Max 150 words. "
+        "Remove outdated info if superseded.\n\n"
+        f"Current state: {old_summary or 'None'}\n\n"
+        f"New turns to integrate:\n{history_text}"
     )
     payload = {
         "model": cfg.default_model,
@@ -1344,6 +1477,104 @@ async def _send_agent_file(bot, chat_id: int, workspace: str,
         await bot.send_message(chat_id=chat_id, text=f"Failed to send file: {exc}")
         return False
 
+
+# ---------------------------------------------------------------------------
+# /autowatch — natural language watcher creation
+# ---------------------------------------------------------------------------
+
+async def autowatch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/autowatch <goal> — AI decides what to monitor and sets it up."""
+    from src.agents.background.manager import BackgroundAgentManager
+    from src.db.key_store import upsert_user
+    cfg = Config.get()
+
+    goal = " ".join(context.args).strip() if context.args else ""
+    if not goal:
+        await update.message.reply_html(
+            "<b>/autowatch</b> — let the AI decide what to monitor\n\n"
+            "<b>Examples:</b>\n"
+            "/autowatch be a guardian to this server\n"
+            "/autowatch monitor my nginx and postgres\n"
+            "/autowatch alert me if disk gets above 80% and report weekly usage\n"
+            "/autowatch watch for OOM killer in dmesg every 5 minutes\n\n"
+            "The AI will decide which watcher types to create, write any needed "
+            "scripts, and start them automatically."
+        )
+        return
+
+    tg_user = update.effective_user
+    chat_id = update.effective_chat.id
+    user_id = await upsert_user(tg_user.id, tg_user.username)
+    manager = BackgroundAgentManager.get()
+
+    if manager is None:
+        await update.message.reply_text("Background manager not running.")
+        return
+
+    sent = await update.message.reply_text(
+        f"{_agent_name(cfg)} is deciding what to monitor..."
+    )
+
+    try:
+        created = await manager.create_from_natural_language(user_id, chat_id, goal)
+        if not created:
+            await context.bot.edit_message_text(
+                chat_id=sent.chat_id, message_id=sent.message_id,
+                text="Could not create any watchers. Try rephrasing or use /watch manually."
+            )
+            return
+
+        lines = [f"Started {len(created)} background agent(s):\n"]
+        for c in created:
+            lines.append(
+                f"<code>{c.id}</code> [{c.watcher_type}] — {_escape_html(c.name)}\n"
+                f"  {_escape_html(c.description[:80])} (every {c.interval_seconds}s)"
+            )
+        lines.append(f"\nUse /watchers to see all · /stopwatch &lt;id&gt; to stop one")
+
+        await context.bot.edit_message_text(
+            chat_id=sent.chat_id, message_id=sent.message_id,
+            text="\n".join(lines), parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.exception("autowatch_failed", error=str(exc))
+        await context.bot.edit_message_text(
+            chat_id=sent.chat_id, message_id=sent.message_id,
+            text=f"Failed: {_escape_html(str(exc))}"
+        )
+
+
+async def pinmemory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pinmemory &lt;key&gt; — pin a memory so it's always injected into context."""
+    from src.db.chat_store import pin_memory
+    from src.db.key_store import upsert_user
+    key = " ".join(context.args).strip() if context.args else ""
+    if not key:
+        await update.message.reply_text("Usage: /pinmemory &lt;key&gt;")
+        return
+    user_id = await upsert_user(update.effective_user.id, update.effective_user.username)
+    ok = await pin_memory(user_id, key)
+    if ok:
+        await update.message.reply_text(f"Pinned: {key}\nThis memory will always be included in context.")
+    else:
+        await update.message.reply_text(f"Memory '{key}' not found. Check /memory for available keys.")
+
+
+async def unpinmemory_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unpinmemory &lt;key&gt; — unpin a memory (retrieved semantically instead)."""
+    from src.db.chat_store import unpin_memory
+    from src.db.key_store import upsert_user
+    key = " ".join(context.args).strip() if context.args else ""
+    if not key:
+        await update.message.reply_text("Usage: /unpinmemory &lt;key&gt;")
+        return
+    user_id = await upsert_user(update.effective_user.id, update.effective_user.username)
+    ok = await unpin_memory(user_id, key)
+    if ok:
+        await update.message.reply_text(f"Unpinned: {key}")
+    else:
+        await update.message.reply_text(f"Memory '{key}' not found.")
+
 # ---------------------------------------------------------------------------
 # Workspace commands
 # ---------------------------------------------------------------------------
@@ -1437,10 +1668,14 @@ def build_application(config: Config):
     app.add_handler(CommandHandler("addkey", addkey_handler))
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("memory", memory_handler))
+    app.add_handler(CommandHandler("pinmemory", pinmemory_handler))
+    app.add_handler(CommandHandler("unpinmemory", unpinmemory_handler))
     app.add_handler(CommandHandler("deletememory", deletememory_handler))
+    app.add_handler(CommandHandler("autowatch", autowatch_handler))
     app.add_handler(CommandHandler("watch", watch_handler))
     app.add_handler(CommandHandler("watchers", watchers_handler))
     app.add_handler(CommandHandler("stopwatch", stopwatch_handler))
+    app.add_handler(CommandHandler("stop", stop_command_handler))
     app.add_handler(CommandHandler("wakelog", wakelog_handler))
     app.add_handler(CommandHandler("providers", providers_handler))
     app.add_handler(CommandHandler("reload", reload_handler))
@@ -1449,10 +1684,17 @@ def build_application(config: Config):
     app.add_handler(CommandHandler("cmdhistory", cmdhistory_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("delete_me", delete_me_handler))
-    app.add_handler(CallbackQueryHandler(callback_query_handler))
+    app.add_handler(CallbackQueryHandler(callback_query_handler, pattern="^(confirm_delete|confirm_cleanws)$"))
+    app.add_handler(CallbackQueryHandler(stop_task_handler, pattern="^stop_task:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, key_submission_handler))
+
+    # Error handler — log all unhandled exceptions
+    async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("unhandled_error", error=context.error, update=update)
+    app.add_error_handler(error_handler)
+
     return app
 
 

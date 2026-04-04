@@ -33,8 +33,48 @@ class ProviderPool:
         return self._locks[key]
 
     async def request_with_key(self, user_id: int, provider: str, payload: dict) -> dict:
+        logger.info("provider_pool_request_start", user_id=user_id, provider=provider)
+        
+        # Debug: log available env vars
+        if user_id not in self._logged_env_check:
+            self._logged_env_check.add(user_id)
+            for var in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+                val = os.environ.get(var, "")
+                logger.info("provider_pool_env_check", var=var, has_value=bool(val.strip()), value_prefix=val[:8] if val else None)
+        
+        # Try the requested provider first
+        try:
+            return await self._request_with_key_impl(user_id, provider, payload)
+        except Exception as exc:
+            logger.warning("provider_pool_primary_failed", provider=provider, error=str(exc))
+            
+            # If g4f is enabled, try it as final fallback
+            if self._is_g4f_enabled():
+                logger.info("provider_pool_trying_g4f_fallback", user_id=user_id)
+                try:
+                    return await self._request_with_key_impl(user_id, "g4f", payload)
+                except Exception as g4f_exc:
+                    logger.error("provider_pool_g4f_fallback_failed", error=str(g4f_exc))
+            
+            # All providers failed
+            raise RuntimeError(f"All providers failed. Last error: {str(exc)}")
+    
+    _logged_env_check: Set[int] = set()
+    
+    def _is_g4f_enabled(self) -> bool:
+        """Check if G4F is enabled in config."""
+        try:
+            from src.config import Config
+            cfg = Config.get()
+            return getattr(cfg, "g4f_enabled", False)
+        except Exception:
+            return False
+    
+    async def _request_with_key_impl(self, user_id: int, provider: str, payload: dict) -> dict:
+        """Internal implementation - try a single provider."""
         norm = self._normalize(provider)
         if norm in _KEYLESS_PROVIDERS:
+            logger.info("provider_pool_keyless", provider=norm)
             adapter = self._make_adapter(norm, "")
             try:
                 return await adapter.request(payload)
@@ -45,19 +85,40 @@ class ProviderPool:
 
         tried: Set[str] = set()
         transient_streak = 0
+        rate_limit_retries = 0
+        max_rate_limit_retries = 3
+        rate_limit_delay = 3
 
         while True:
-            async with self._get_lock(user_id, norm):
+            # Acquire lock with timeout to prevent deadlocks
+            lock = self._get_lock(user_id, norm)
+            logger.info("provider_pool_acquiring_lock", user_id=user_id, provider=norm)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=5.0)
+                logger.info("provider_pool_lock_acquired", user_id=user_id, provider=norm)
+            except asyncio.TimeoutError:
+                logger.error("provider_pool_lock_timeout", user_id=user_id, provider=norm)
+                raise RuntimeError(f"Lock timeout for {provider}")
+            
+            try:
+                logger.info("provider_pool_selecting_key", user_id=user_id, provider=norm)
                 k = await self._select_key(user_id, norm, exclude=tried)
+                logger.info("provider_pool_key_selected", user_id=user_id, provider=norm, key_id=k["id"] if k else None)
+            finally:
+                lock.release()
 
             if k is None:
-                raise RuntimeError(f"All {provider} keys exhausted ({len(tried)} tried).")
+                logger.error("provider_pool_no_key", user_id=user_id, provider=norm)
+                raise RuntimeError(f"No {provider} API key found. Add one with /addkey {provider}:\"key\"")
 
             api_key: str = k["raw_key"]
+            logger.info("provider_pool_got_key", user_id=user_id, provider=norm, key_prefix=api_key[:8] if api_key else None)
             adapter = self._make_adapter(norm, api_key)
 
             try:
+                logger.info("provider_pool_making_request", user_id=user_id, provider=norm)
                 resp = await adapter.request(payload)
+                logger.info("provider_pool_request_success", user_id=user_id, provider=norm)
                 await self._record_usage(k)
                 # Token accounting
                 usage = resp.get("usage")
@@ -71,37 +132,49 @@ class ProviderPool:
                 return resp
 
             except ProviderAuthError as exc:
-                logger.error("key_auth_failed", key_id=k["id"], provider=norm, error=str(exc))
+                logger.error("provider_pool_auth_failed", key_id=k["id"], provider=norm, error=str(exc))
                 if k["id"] >= 0:
                     await key_store.blacklist_key(k["id"], reason="auth_failed")
                 tried.add(api_key)
                 transient_streak = 0
+                rate_limit_retries = 0
 
             except ProviderQuotaError as exc:
                 err_lower = str(exc).lower()
                 is_rate_limit = any(x in err_lower for x in ["429","rate limit","too many","tpm","rpm"])
                 if is_rate_limit:
-                    tried.add(api_key)
-                    transient_streak = 0
-                    next_k = await self._select_key(user_id, norm, exclude=tried)
-                    if next_k is None:
-                        tried.discard(api_key)
-                        await asyncio.sleep(5)
+                    rate_limit_retries += 1
+                    logger.warning("provider_pool_rate_limit", provider=norm, key_id=k["id"], retry=rate_limit_retries, max=max_rate_limit_retries)
+
+                    if rate_limit_retries < max_rate_limit_retries:
+                        # Wait and retry same key
+                        logger.info("provider_pool_rate_limit_retrying", provider=norm, delay=rate_limit_delay)
+                        await asyncio.sleep(rate_limit_delay)
+                        continue
+                    else:
+                        # Max retries reached, try next provider
+                        logger.warning("provider_pool_rate_limit_max_retries", provider=norm, retries=rate_limit_retries)
+                        tried.add(api_key)
+                        rate_limit_retries = 0
+                        # Raise to trigger fallback to next provider
+                        raise ProviderQuotaError(f"Rate limit exceeded after {max_rate_limit_retries} retries")
                 else:
-                    logger.warning("hard_quota_blacklisting", provider=norm, key_id=k["id"])
+                    logger.warning("provider_pool_hard_quota", provider=norm, key_id=k["id"])
                     if k["id"] >= 0:
                         await key_store.blacklist_key(k["id"], reason="quota_exceeded",
                                                       quota_resets_at=self._estimate_reset(norm))
                     tried.add(api_key)
                     transient_streak = 0
+                    rate_limit_retries = 0
 
             except (ProviderTransientError, Exception) as exc:
                 transient_streak += 1
-                logger.warning("transient_error", provider=norm, key_id=k["id"],
+                logger.warning("provider_pool_transient_error", provider=norm, key_id=k["id"],
                                streak=transient_streak, error=str(exc))
                 if transient_streak >= _MAX_TRANSIENT_PER_KEY:
                     tried.add(api_key)
                     transient_streak = 0
+                    rate_limit_retries = 0
                 else:
                     await asyncio.sleep(min(2 ** transient_streak, 30))
 
@@ -174,7 +247,22 @@ class ProviderPool:
         db_keys = await key_store.list_api_keys(user_id)
         norm_p = self._normalize(provider)
         provider_keys = [k for k in db_keys if self._normalize(k.get("provider", "")) == norm_p]
-        env_str = os.environ.get(f"{provider.upper()}_API_KEY", "")
+        
+        # Check env vars - try both normalized and original provider names
+        env_variants = [
+            f"{provider.upper()}_API_KEY",
+            f"{norm_p.upper()}_API_KEY",
+        ]
+        # Special case for gemini/google
+        if norm_p == "gemini":
+            env_variants.append("GOOGLE_API_KEY")
+        
+        for env_var in env_variants:
+            env_str = os.environ.get(env_var, "")
+            if env_str.strip():
+                logger.info("provider_pool_found_env_key", provider=provider, env_var=env_var)
+                break
+        
         for i, raw in enumerate([r.strip() for r in env_str.replace(",", " ").split() if r.strip()]):
             usage_key = f"{provider}:{raw[:12]}"
             provider_keys.append({"id": -(i+1), "provider": provider, "raw_key": raw,
@@ -182,6 +270,8 @@ class ProviderPool:
                                   "last_used_at": _VIRTUAL_KEY_USAGE.get(usage_key, datetime.min).isoformat(),
                                   "quota_resets_at": None, "usage_key": usage_key})
         if not provider_keys:
+            logger.warning("provider_pool_no_keys_found", provider=provider, user_id=user_id, 
+                          env_vars_checked=env_variants, db_keys_count=len(db_keys))
             return None
 
         def _lru(k):
@@ -249,6 +339,28 @@ class ProviderPool:
             return G4FProvider()
         from src.providers.openrouter_provider import OpenRouterProvider
         return OpenRouterProvider(api_key)
+
+    async def get_available_providers(self, user_id: int) -> List[str]:
+        """Return list of providers that have valid API keys available."""
+        available = []
+        db_keys = await key_store.list_api_keys(user_id)
+        
+        # Check common providers
+        for provider in ["gemini", "groq", "openrouter", "ollama", "g4f"]:
+            # Check env keys
+            env_key = os.environ.get(f"{provider.upper()}_API_KEY", "")
+            if env_key.strip():
+                available.append(provider)
+                continue
+            
+            # Check DB keys (non-blacklisted)
+            provider_keys = [k for k in db_keys 
+                           if self._normalize(k.get("provider", "")) == provider 
+                           and not k.get("is_blacklisted")]
+            if provider_keys:
+                available.append(provider)
+        
+        return available
 
     def _estimate_reset(self, provider: str) -> Optional[str]:
         try:

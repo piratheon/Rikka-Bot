@@ -1,6 +1,6 @@
 [project]
 name = "rk-agent"
-version = "3.0.0"
+version = "2.1.0"
 description = "rk-agent — agentic Telegram assistant with background monitoring"
 requires-python = ">=3.12"
 dependencies = [

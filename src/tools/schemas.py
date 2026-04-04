@@ -261,6 +261,81 @@ ALL_SCHEMAS: List[ToolSchema] = [
         },
         required_params=["query"],
     ),
+
+    ToolSchema(
+        name="use_skill",
+        description=(
+            "Load and execute a stored skill by name. "
+            "Skills are reusable scripts, templates, or procedures you saved previously. "
+            "Use list_workspace or get_memories to discover available skill names first, "
+            "then call this to load the skill's code or instructions into context."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "skill_name": _str_param("The exact name of the skill to load."),
+            },
+        },
+        required_params=["skill_name"],
+    ),
+
+    ToolSchema(
+        name="watch_task_logs",
+        description=(
+            "Watch a log file for recent entries. Returns the last N lines of the file. "
+            "Use for checking application logs, system logs, or any text file that grows over time."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": _str_param("Path to the log file to watch."),
+                "lines": _int_param("Number of lines to return.", default=30),
+            },
+        },
+        required_params=["file_path"],
+    ),
+
+    ToolSchema(
+        name="write_file",
+        description=(
+            "Write text, JSON, code, or any content to a file in the workspace. "
+            "Use for saving research findings, analysis results, generated code, configs, or data exports. "
+            "Automatically creates parent directories if needed. "
+            "For JSON data, pass the serialized JSON string as 'content'."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": _str_param("Path relative to workspace, e.g., 'research/notes.md', 'data/results.json', 'scripts/analyze.py'."),
+                "content": _str_param("The content to write. Can be plain text, JSON, code, markdown, etc."),
+                "mode": {
+                    "type": "string",
+                    "description": "Write mode: 'w' to overwrite (default), 'a' to append.",
+                    "enum": ["w", "a"],
+                    "default": "w",
+                },
+            },
+        },
+        required_params=["path", "content"],
+    ),
+
+    ToolSchema(
+        name="read_file",
+        description=(
+            "Read content from a file in the workspace. "
+            "Use for analyzing saved research data, reviewing generated code, checking configs, or examining results. "
+            "Returns up to 200 lines by default. For larger files, use run_shell_command with 'head' or 'tail'."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": _str_param("Path relative to workspace, e.g., 'research/notes.md', 'data/results.json', 'scripts/analyze.py'."),
+                "max_lines": _int_param("Maximum lines to return.", default=200),
+            },
+        },
+        required_params=["path"],
+    ),
+
 ]
 
 # Fast lookup by name

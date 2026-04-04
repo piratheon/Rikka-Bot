@@ -33,6 +33,13 @@ soul.md
 config.json
 ToDo.md
 
+# Web UI (unimplemented)
+index.html
+rk-webui_demo.html
+
+# Docs (added manually to GitHub later)
+docs/
+
 # OS
 .DS_Store
 Thumbs.db
